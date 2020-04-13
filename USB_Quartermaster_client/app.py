@@ -36,7 +36,7 @@ def formatted_print(message: str):
     print(f"{duration:.1f} {message}")
 
 
-@lru_cache
+@lru_cache()
 def get_loaded_drivers() -> Dict[str, AbstractLocalDriver]:
     return {cls.IDENTIFIER: cls for cls in plugins.local_driver_classes()}
 
