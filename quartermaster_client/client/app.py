@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
-import asyncio
 import json
 import logging
+import platform
 import signal
 import socket
 import ssl
 import sys
 import time
 from argparse import Namespace, ArgumentParser
-from asyncio import CancelledError
-from functools import partial, lru_cache
+from concurrent.futures import ThreadPoolExecutor
+from functools import lru_cache
+from select import select
+from threading import Event
 from typing import Dict, List, NamedTuple, Optional
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
@@ -59,25 +61,21 @@ class Device(object):
         else:
             raise SystemError(f"No driver found to support '{conf['driver']}'")
 
-    async def async_init(self):
-        await self.driver.async_init()
-        await self.connect()
-
-    async def connect(self):
-        if not await self.connected():
+    def connect(self):
+        if not self.connected():
             formatted_print(f"Connecting {self.name}")
-            await self.driver.connect()
+            self.driver.connect()
             self.connect_complete = True
             formatted_print(f"Done connecting {self.name}")
 
-    async def disconnect(self):
-        if await self.connected():
+    def disconnect(self):
+        if self.connected():
             formatted_print(f"Disconnecting {self.name}")
-            await self.driver.disconnect()
+            self.driver.disconnect()
             formatted_print(f"Done disconnecting {self.name}")
 
-    async def connected(self):
-        return await self.driver.connected()
+    def connected(self):
+        return self.driver.connected()
 
     def __str__(self):
         return self.name
@@ -91,18 +89,18 @@ class Reservation(NamedTuple):
     auth_token: str = None
 
 
-async def manage_devices(devices: List[Device], polling_interval: int):
-    for device in devices:
-        await device.async_init()
-    formatted_print("Setup complete, keep this terminal open to keep your reservation active")
-
-    while True:
-        await asyncio.sleep(polling_interval)
+def manage_devices(devices: List[Device], polling_interval: int, teardown: Event):
+    setup_done = False
+    while not teardown.is_set():
         for device in devices:
-            await device.connect()  # connect() is lazy, if device is connected it won't do anything
+            device.connect()  # connect() is lazy, if device is connected it won't do anything
+        if not setup_done:
+            formatted_print("Setup complete, keep this terminal open to keep your reservation active")
+            setup_done = True
+        teardown.wait(polling_interval)
 
 
-async def disconnect_devices(devices: List[Device]):
+def disconnect_devices(devices: List[Device]):
     """
     Disconnect devices
 
@@ -112,7 +110,7 @@ async def disconnect_devices(devices: List[Device]):
         if device.connect_complete:
             formatted_print(f"Disconnecting {device.name}")
             try:
-                await device.disconnect()
+                device.disconnect()
             except Exception as e:  # Swallowing exception so disconnection failures don't impact each other
                 error_counter += 1
                 formatted_print(f"Got the following exception when trying to disconnect {device.name}: {e}")
@@ -120,8 +118,8 @@ async def disconnect_devices(devices: List[Device]):
             formatted_print(f"Skipping disconnecting {device.name} as it never completed connecting")
 
 
-async def get_resource_status(url: str, config: Namespace, teardown: asyncio.Event):
-    while True:
+def get_resource_status(url: str, config: Namespace, teardown: Event):
+    while not teardown.is_set():
         logger.debug('+')
         refresh_successful = None
         for _ in range(0, REFRESH_RETRY_LIMIT):
@@ -129,13 +127,13 @@ async def get_resource_status(url: str, config: Namespace, teardown: asyncio.Eve
                 refresh_successful = refresh_reservation(url, config.auth_token, config.disable_validation)
                 break  # The retry loop
             except Exception:
-                await asyncio.sleep(REFRESH_RETRY_SLEEP)
+                teardown.wait(REFRESH_RETRY_SLEEP)
         else:
             logger.error(f"Failed to reach Quartermaster server after {REFRESH_RETRY_LIMIT} tries. Triggering teardown")
             teardown.set()
 
         if refresh_successful:
-            await asyncio.sleep(config.reservation_polling)
+            teardown.wait(config.reservation_polling)
             continue
         else:
             formatted_print("Reservation expired, triggering teardown")
@@ -153,6 +151,11 @@ def preflight_checks(reservation: Reservation):
         driver_name = device.conf['driver']
         if driver_name in drivers_checked:
             continue
+        if driver_name not in loaded_drivers:
+            formatted_print(f"No driver found to support '{driver_name}', perhaps you mare missing a plugin. You"
+                            f"might want to try 'pip install USB_Quartermaster_{driver_name}' to see if there is a"
+                            f" driver")
+            raise ModuleNotFoundError(f"No driver found to support {driver_name}")
         formatted_print(f"Preflight checking {driver_name}")
         device.driver.preflight_check()
         drivers_checked.add(driver_name)
@@ -251,7 +254,9 @@ def refresh_reservation(url: str, auth_token: Optional[str] = None, disable_vali
 
 
 def cancel_reservation(url: str, auth_token: Optional[str] = None, disable_validation=False) -> bool:
-    formatted_print(f"Canceling reservation for resource {url}")
+    formatted_print(f"Canceling reservation for resource {url}, please wait")
+    return True
+
     http_code, content, _ = quartermaster_request(url=url,
                                                   token=auth_token,
                                                   method='DELETE',
@@ -262,34 +267,32 @@ def cancel_reservation(url: str, auth_token: Optional[str] = None, disable_valid
     raise ConnectionError(f"Unexpected response when canceling reservation, HTTP CODE={http_code}, CONTENT={content}")
 
 
-async def process_command(reader, writer, teardown: asyncio.Event):
-    while True:
-        data = await reader.read(100)
-        if data == b'':  # This means EOF was received and the internal buffer is empty
-            break
+def wait_for_commands(config: Namespace, teardown: Event):
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind((config.listen_ip, config.listen_port))
+            logger.debug(f"Listening on {config.listen_ip}:{config.listen_port} for commands")
+            sock.listen(1)
+            while not teardown.is_set():
+                # Check once a second and see if have any incoming connections
+                readable, _, _ = select([sock], [], [], 1)
+                if len(readable) == 0:
+                    continue
 
-        logger.debug(f"Command received, {data}")
-        if data.startswith(TEARDOWN_COMMAND + b"\r") or data.startswith(TEARDOWN_COMMAND + b"\n"):
-            writer.write(TEARDOWN_ACK)
-            formatted_print(TEARDOWN_ACK.decode('utf-8'))
-            teardown.set()
-            await writer.drain()
-            writer.close()
-            await writer.wait_closed()
+                conn, addr = sock.accept()
 
-
-async def wait_for_commands(config: Namespace, teardown: asyncio.Event):
-    while True and not teardown.is_set():
-        try:
-            server = await asyncio.start_server(partial(process_command, teardown=teardown), host=config.listen_ip,
-                                                port=config.listen_port)
-
-            async with server:
-                logger.debug(f"Listening on {config.listen_ip}:{config.listen_port} for commands")
-                await server.serve_forever()
-        except Exception as e:
-            formatted_print(f"Exception when trying to to start command listener: {repr(e)}")
-            teardown.set()
+                data = conn.recv(1024)
+                logger.debug(f"Command received, {data}")
+                if not data:
+                    continue
+                if data.startswith(TEARDOWN_COMMAND + b"\r") \
+                        or data.startswith(TEARDOWN_COMMAND + b"\n"):
+                    conn.sendall(TEARDOWN_ACK)
+                    formatted_print(TEARDOWN_ACK.decode('utf-8'))
+                    teardown.set()
+    except Exception as e:
+        formatted_print(f"Exception when trying to to start command listener: {repr(e)}")
+        teardown.set()
 
 
 def initiate_teardown(config: Namespace):
@@ -305,45 +308,30 @@ def initiate_teardown(config: Namespace):
         exit(1)
 
 
-async def start_tasks(reservation: Reservation, config: Namespace):
-    teardown_event = asyncio.Event()
-    loop = asyncio.get_event_loop()
-    runtime_tasks = [
-        loop.create_task(manage_devices(devices=reservation.devices, polling_interval=config.device_polling)),
-        loop.create_task(
-            get_resource_status(url=reservation.resource_url, config=config, teardown=teardown_event)),
-        loop.create_task(wait_for_commands(config=config, teardown=teardown_event))
-    ]
+def start_threads(reservation: Reservation, config: Namespace):
+    teardown_event = Event()
 
-    loop.add_signal_handler(signal.SIGINT, teardown_event.set)  # ctrl-c
-    loop.add_signal_handler(signal.SIGTERM, teardown_event.set)  # kill
-    loop.add_signal_handler(signal.SIGTERM, teardown_event.set)  # quit
-    loop.add_signal_handler(signal.SIGHUP, teardown_event.set)  # Hangup (closed terminal?)
-
-    teardown_task = loop.create_task(
-        perform_teardown(tasks=runtime_tasks, teardown_event=teardown_event, devices=reservation.devices))
-    try:
-        await asyncio.gather(*runtime_tasks, teardown_task)
-    except CancelledError:
-        pass  # This is expected as part of the teardown flow
-    except Exception as e:  # If any task blows up trigger a teardown
+    def signal_handler(signal_num, stack_frame):
+        logger.debug(f"Signal {signal_num} caught, triggering teardown")
         teardown_event.set()
-        await teardown_task
-        raise e
+        logger.debug("teardown_event.set()")
 
+    signal.signal(signal.SIGINT, signal_handler)  # ctrl-c
+    signal.signal(signal.SIGTERM, signal_handler)  # kill
+    if platform.system().lower() != "windows":
+        signal.signal(signal.SIGQUIT, signal_handler)  # quit
+        signal.signal(signal.SIGHUP, signal_handler)  # Hangup (closed terminal?)
 
-async def perform_teardown(tasks: List, teardown_event: asyncio.Event, devices: List[Device]):
-    """
-    This does the work of cleanly shutting down the client.
-    That includes canceling all the other tasks and disconnect
-    """
-    await teardown_event.wait()
-    for task in tasks:
-        task.cancel()
+    with ThreadPoolExecutor() as pool:
+        pool.submit(manage_devices, devices=reservation.devices, polling_interval=config.device_polling,
+                    teardown=teardown_event)
+        pool.submit(get_resource_status, url=reservation.resource_url, config=config, teardown=teardown_event)
+        pool.submit(wait_for_commands, config=config, teardown=teardown_event)
 
-    await asyncio.wait(tasks, return_when=asyncio.ALL_COMPLETED)
+    while not teardown_event.is_set():
+        teardown_event.wait()
 
-    errors_encountered = await disconnect_devices(devices)  # TODO: Should make this durable, i.e. ignore exceptions
+    disconnect_devices(reservation.devices)
 
 
 def load_arguments(args: List[str], reservation_message=None, auth_token=None, reservation_url=None) -> Namespace:
@@ -384,8 +372,6 @@ def main(args: List[str]):
         initiate_teardown(config=config)
         return
 
-    loaded_drivers = {cls.IDENTIFIER: cls for cls in plugins.local_driver_classes()}
-
     reservation = None
     try:
         reservation = get_quartermaster_reservation(url=config.quartermaster_url,
@@ -395,7 +381,7 @@ def main(args: List[str]):
         formatted_print(f"Reservation active for resource {reservation.resource_url}")
         preflight_checks(reservation)
 
-        asyncio.run(start_tasks(reservation, config), debug=config.debug)
+        start_threads(reservation, config)
 
         formatted_print("Cleanup done")
     except Exception as e:
@@ -412,7 +398,6 @@ def main(args: List[str]):
         exit(1)
 
     if reservation is not None:
-        formatted_print(f"Canceling reservation for resource {reservation.resource_url}, please wait")
         cancel_reservation(url=reservation.reservation_url, auth_token=reservation.auth_token,
                            disable_validation=config.disable_validation)
 
