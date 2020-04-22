@@ -8,7 +8,7 @@ packages = [
 ]
 
 [tool.poetry.scripts]
-quartermaster_client = 'USB_Quartermaster_client.__main__:run'
+quartermaster_client = 'quartermaster_client.__main__:run'
 
 [tool.poetry.dependencies]
 python = "^3.7"
