@@ -255,7 +255,6 @@ def refresh_reservation(url: str, auth_token: Optional[str] = None, disable_vali
 
 def cancel_reservation(url: str, auth_token: Optional[str] = None, disable_validation=False) -> bool:
     formatted_print(f"Canceling reservation for resource {url}, please wait")
-    return True
 
     http_code, content, _ = quartermaster_request(url=url,
                                                   token=auth_token,
