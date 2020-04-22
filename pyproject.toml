@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "USB_Quartermaster_client"
-version = "0.1.0"
+version = "0.1.1"
 description = "Client to connect USB devices managed by Quartermaster Server"
 authors = ["Tim Laurence <timdaman@gmail.com>"]
 packages = [
